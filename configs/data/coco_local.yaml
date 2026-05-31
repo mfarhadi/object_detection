@@ -1,0 +1,13 @@
+dataset:
+  root: /data/yolo/datasets/coco
+  train: train2017.txt
+  val: val2017.txt
+  test: test-dev2017.txt
+  names: /data/yolo/coco.yaml
+
+loader:
+  image_size: 640
+  letterbox: true
+  batch_size: 16
+  num_workers: 8
+  pin_memory: true
