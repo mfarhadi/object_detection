@@ -32,7 +32,7 @@ scripts/check_coco_loader.py       # Loader smoke test
 scripts/train_resnet_yolo.py       # Educational ResNet-101 DDP one-anchor trainer
 src/yolo_tests/models/             # ResNet detector model
 src/yolo_tests/losses/             # Clear one-anchor YOLO loss
-tests/test_coco_yolo_dataset.py    # Synthetic dataset tests
+tests/test_coco_yolo_dataset.py    # Synthetic dataset test
 ```
 
 
