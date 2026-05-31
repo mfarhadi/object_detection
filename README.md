@@ -35,38 +35,4 @@ src/yolo_tests/losses/             # Clear one-anchor YOLO loss
 tests/test_coco_yolo_dataset.py    # Synthetic dataset tests
 ```
 
-## COCO 2017 (YOLO Format)
 
-Full COCO 2017 object detection dataset in Ultralytics YOLO bbox format.
-
-## Dataset location
-
-```
-/data/yolo/datasets/coco/
-├── images/
-│   ├── train2017/   # 118,287 images
-│   └── val2017/     # 5,000 images
-├── labels/
-│   ├── train2017/   # YOLO .txt labels (class x y w h, normalized)
-│   └── val2017/
-├── train2017.txt
-└── val2017.txt
-```
-
-## Train with YOLO
-
-```bash
-yolo detect train data=/data/yolo/coco.yaml model=yolo11n.pt epochs=100
-```
-
-## Re-download
-
-```bash
-python3 /data/yolo/download_coco.py
-```
-
-## Monitor in-progress download
-
-```bash
-tail -f /data/yolo/download_coco.log
-```
