@@ -7,7 +7,9 @@ The first implemented piece is a COCO image loader for Ultralytics-style YOLO
 labels. It reads images with OpenCV, converts images and boxes with torchvision,
 and returns both pixel `xyxy` boxes and normalized YOLO `cxcywh` boxes.
 
-For usage examples, test commands, and the current feature list, see `docs/INSTRUCTIONS.md`.
+For usage examples, test commands, and the current feature list, see
+`docs/INSTRUCTIONS.md`. For W&B monitoring, DVC reproduction, and dataset/model
+inventory, see `docs/EXPERIMENT_TRACKING.md`.
 
 ## Loader smoke test
 
@@ -27,12 +29,12 @@ single-node or multi-node DDP/FSDP launchers.
 
 ```text
 configs/data/coco_local.yaml       # Local dataset and loader defaults
+params.yaml                        # DVC experiment parameters
+dvc.yaml                           # DVC training stage and artifact declarations
 src/yolo_tests/data/coco_yolo.py   # OpenCV + torchvision COCO/YOLO loader
 scripts/check_coco_loader.py       # Loader smoke test
-scripts/train_resnet_yolo.py       # Educational ResNet-101 DDP one-anchor trainer
+scripts/train_resnet_yolo.py       # Educational ResNet DDP anchor-free trainer
 src/yolo_tests/models/             # ResNet detector model
-src/yolo_tests/losses/             # Clear one-anchor YOLO loss
+src/yolo_tests/losses/             # Clear anchor-free YOLO loss
 tests/test_coco_yolo_dataset.py    # Synthetic dataset test
 ```
-
-

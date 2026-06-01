@@ -1,4 +1,4 @@
-"""Clear educational loss for the one-anchor YOLO-style model.
+"""Clear educational loss for the anchor-free YOLO-style model.
 
 This file favors readability over speed. It shows the key steps that a YOLO loss
 needs:
@@ -24,7 +24,7 @@ from torch.nn import functional as F
 
 
 @dataclass
-class OneAnchorTargets:
+class AnchorFreeTargets:
     """Dense training targets after assigning objects to grid cells."""
 
     class_targets: Tensor  # [B, H, W, C], one-hot at positive cells, zero elsewhere
@@ -63,7 +63,7 @@ def build_multi_positive_targets(
     grid_w: int,
     num_classes: int,
     device: torch.device,
-) -> OneAnchorTargets:
+) -> AnchorFreeTargets:
     """
     Multi-positive assignment.
 
@@ -83,7 +83,7 @@ def build_multi_positive_targets(
     best_score = torch.full((batch_size, grid_h, grid_w), float("inf"), device=device)
 
     if yolo_targets.numel() == 0:
-        return OneAnchorTargets(class_targets, box_targets, positive_mask)
+        return AnchorFreeTargets(class_targets, box_targets, positive_mask)
 
     yolo_targets = yolo_targets.to(device=device, dtype=torch.float32)
 
@@ -144,18 +144,18 @@ def build_multi_positive_targets(
         positive_mask[batch_index, ys, xs] = True
         best_score[batch_index, ys, xs] = score[ys, xs]
 
-    return OneAnchorTargets(class_targets, box_targets, positive_mask)
+    return AnchorFreeTargets(class_targets, box_targets, positive_mask)
 
 
-def build_one_anchor_targets(
+def build_anchor_free_targets(
     yolo_targets: Tensor,
     batch_size: int,
     grid_h: int,
     grid_w: int,
     num_classes: int,
     device: torch.device,
-) -> OneAnchorTargets:
-    """Backward-compatible name for the current multi-positive assignment."""
+) -> AnchorFreeTargets:
+    """Canonical name for the multi-positive anchor-free assignment."""
 
     return build_multi_positive_targets(
         yolo_targets=yolo_targets,
@@ -167,8 +167,28 @@ def build_one_anchor_targets(
     )
 
 
-class OneAnchorYoloLoss(nn.Module):
-    """Loss for a one-anchor, class-plus-box YOLO head.
+def build_one_anchor_targets(
+    yolo_targets: Tensor,
+    batch_size: int,
+    grid_h: int,
+    grid_w: int,
+    num_classes: int,
+    device: torch.device,
+) -> AnchorFreeTargets:
+    """Backward-compatible name for the current multi-positive assignment."""
+
+    return build_anchor_free_targets(
+        yolo_targets=yolo_targets,
+        batch_size=batch_size,
+        grid_h=grid_h,
+        grid_w=grid_w,
+        num_classes=num_classes,
+        device=device,
+    )
+
+
+class AnchorFreeYoloLoss(nn.Module):
+    """Loss for an anchor-free, class-plus-box YOLO head.
 
     The model should return:
         predictions["class_logits"]: [B, C, H, W]
@@ -290,3 +310,7 @@ class OneAnchorYoloLoss(nn.Module):
             "mean_iou": mean_iou.detach(),
             "num_positive": positive_count.detach().to(torch.float32),
         }
+
+
+OneAnchorTargets = AnchorFreeTargets
+OneAnchorYoloLoss = AnchorFreeYoloLoss

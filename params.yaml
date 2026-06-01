@@ -1,0 +1,45 @@
+train:
+  root: /data/yolo/datasets/coco
+  split: train2017
+  val_split: val2017
+  image_size: 640
+  batch_size: 8
+  workers: 8
+  epochs: 100
+  lr: 0.001
+  weight_decay: 0.0001
+  output_dir: runs/resnet_anchor_free
+  save_every: 1
+  names_yaml: /data/yolo/coco.yaml
+
+model:
+  backbone: resnet101
+  weights: default
+  head_channels: 256
+  num_classes: 80
+
+loss:
+  class_weight: 1.0
+  box_weight: 5.0
+  negative_class_weight: 0.02
+
+validation:
+  score_threshold: 0.001
+  iou_threshold: 0.5
+  nms_threshold: 0.5
+  pre_nms_topk: 1000
+  max_detections: 100
+  plot_score_threshold: 0.25
+  plot_max_boxes: 20
+
+reproducibility:
+  seed: 42
+
+tracking:
+  wandb_mode: disabled
+  wandb_project: yolo-backbone-tests
+  wandb_log_every: 10
+  wandb_log_checkpoints: none
+
+reports:
+  dir: reports/resnet_anchor_free

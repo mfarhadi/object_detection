@@ -180,11 +180,11 @@ If `pytest` is missing, install the dev dependencies in your environment first.
 
 ## Educational ResNet Training
 
-This project now includes a simple one-anchor YOLO-style trainer. The default
+This project now includes a simple anchor-free YOLO-style trainer. The default
 training backbone is pretrained torchvision ResNet-101. The model reads three
 feature levels (`layer2`, `layer3`, `layer4`), upsamples the last two levels to
-the first level, concatenates all three, and predicts `80 + 4` channels with a
-1x1 convolution.
+the first level, concatenates all three, and predicts class logits plus six
+anchor-free box channels: `dx`, `dy`, `left`, `top`, `right`, and `bottom`.
 
 Run a tiny CPU smoke training pass without downloading pretrained weights:
 
@@ -196,6 +196,7 @@ PYTHONPATH=/data/yolo/src python3 /data/yolo/scripts/train_resnet_yolo.py \
   --batch-size 2 \
   --workers 0 \
   --image-size 128 \
+  --epochs 1 \
   --max-steps 1 \
   --device cpu
 ```
@@ -216,14 +217,14 @@ PYTHONPATH=/data/yolo/src torchrun \
   --workers 8 \
   --image-size 640 \
   --progress auto \
-   --nccl-safe-mode
+  --nccl-safe-mode
 ```
 
 `--progress auto` shows a rank-0 progress bar with loss, class loss, box loss, positives, and throughput. Use `--progress text` for periodic plain logs or `--progress none` for summary-only runs.
 
 After every epoch the trainer runs validation on `--val-split val2017` by
 default, prints `mAP@0.50`, and saves one overlay image to
-`runs/resnet_one_anchor/val_examples/epoch_001.png`. Green boxes are validation
+`runs/resnet_anchor_free/val_examples/epoch_001.png`. Green boxes are validation
 labels and red dashed boxes are predictions. The plotted image cycles by epoch
 by default; use `--val-plot-sample-index 0` to pin a fixed validation image.
 Plot overlays use `--val-plot-score-threshold`, which is separate from the
@@ -235,13 +236,36 @@ Loss/progress metrics:
 
 ```text
 loss      weighted total loss used for backprop
-pos_cls   true-object class BCE plus a small penalty for other class channels
+pos_cls   true-object class loss plus a small penalty for other class channels
 bg        background class BCE before negative weighting
 box       IoU loss plus a small normalized L1 box penalty
 iou       mean IoU at positive assigned grid cells
 pcls      mean predicted probability of the target class at positive cells
 pos       number of positive assigned grid cells in the local rank batch
 ```
+
+Experiment monitoring and reproducibility are wired into the trainer. Use W&B
+only when you explicitly request it:
+
+```bash
+export WANDB_API_KEY='replace-with-your-key'
+PYTHONPATH=/data/yolo/src python3 /data/yolo/scripts/train_resnet_yolo.py \
+  --root /data/yolo/datasets/coco \
+  --wandb-mode online \
+  --wandb-project yolo-backbone-tests
+```
+
+Rank 0 writes `metrics.json`, `metrics_history.jsonl`, `run_manifest.json`, and
+dataset/model inventory JSON under the output directory by default. The DVC
+stage writes those report files under `reports/resnet_anchor_free` so DVC can
+track reports separately from cached checkpoints:
+
+```bash
+dvc repro train_resnet_anchor_free
+dvc metrics show
+```
+
+See `docs/EXPERIMENT_TRACKING.md` for the full W&B, DVC, and inventory workflow.
 
 If the run spins at 100% GPU before the first batch, it is usually hanging
 during NCCL/DDP model synchronization. Use `--debug-stages` to see the last
@@ -321,11 +345,12 @@ For pretrained weights, make sure every node can read the torchvision weight
 cache. The easiest options are to pre-cache the weights on each node, or point
 `TORCH_HOME` to a shared filesystem before launching `torchrun`.
 
-The model code lives in `src/yolo_tests/models/resnet_one_anchor.py`. The loss
-code lives in `src/yolo_tests/losses/one_anchor_yolo_loss.py`. The loss is
-written for clarity: it assigns every ground-truth object to one grid cell, uses
-BCE over the 80 class logits, and applies Smooth L1 only to boxes at positive
-grid cells.
+The model code is exported from `src/yolo_tests/models/resnet_anchor_free.py`.
+The loss code is exported from `src/yolo_tests/losses/anchor_free_yolo_loss.py`.
+Compatibility wrappers remain for the old one-anchor module names. The loss is
+written for clarity: it assigns every ground-truth object to one or more
+positive grid cells, uses class logits for foreground/background supervision,
+and applies IoU plus L1 box loss only at positive grid cells.
 
 ## Current Features
 
@@ -346,23 +371,28 @@ Implemented now:
 - Educational pretrained ResNet-101 DDP training entrypoint.
 - Per-epoch validation with mAP at a configurable IoU threshold, default 0.50.
 - Per-epoch validation example image with ground-truth and predicted boxes.
+- Rank-0 W&B monitoring for train/validation metrics and validation images.
+- Run manifests plus dataset/model inventory JSON for experiment review.
+- DVC pipeline, params, metrics, and artifact declarations for dataset/model reproducibility.
 
 Not implemented yet:
 
 - Large-scale backbone comparison registry and experiment sweeps.
 - Mosaic, mixup, random affine, HSV, or advanced detection augmentation.
-- Checkpointing and experiment logging.
 - Production-grade DDP/FSDP checkpoint sharding and resume logic.
 
 ## Useful Files
 
 ```text
 configs/data/coco_local.yaml       local dataset and loader defaults
+params.yaml                        DVC experiment parameter defaults
+dvc.yaml                           DVC pipeline, metrics, and artifact declarations
 src/yolo_tests/data/coco_yolo.py   dataset, collate, and dataloader code
 scripts/check_coco_loader.py       real COCO loader smoke check
 scripts/train_resnet_yolo.py       ResNet-101 DDP training entrypoint
+docs/EXPERIMENT_TRACKING.md        W&B, DVC, and inventory guide
 src/yolo_tests/models/             educational detector model
-src/yolo_tests/losses/             educational one-anchor loss
+src/yolo_tests/losses/             educational anchor-free loss
 tests/test_coco_yolo_dataset.py    small synthetic tests
 coco.yaml                          COCO class names and Ultralytics data config
 ```

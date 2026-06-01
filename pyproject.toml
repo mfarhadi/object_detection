@@ -21,6 +21,10 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.8",
 ]
+experiment = [
+    "dvc>=3.50",
+    "wandb>=0.17",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

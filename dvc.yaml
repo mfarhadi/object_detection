@@ -1,0 +1,88 @@
+stages:
+  train_resnet_anchor_free:
+    cmd: >-
+      PYTHONPATH=src python3 scripts/train_resnet_yolo.py
+      --root ${train.root}
+      --split ${train.split}
+      --val-split ${train.val_split}
+      --image-size ${train.image_size}
+      --batch-size ${train.batch_size}
+      --workers ${train.workers}
+      --epochs ${train.epochs}
+      --lr ${train.lr}
+      --weight-decay ${train.weight_decay}
+      --output-dir ${train.output_dir}
+      --save-every ${train.save_every}
+      --names-yaml ${train.names_yaml}
+      --backbone ${model.backbone}
+      --weights ${model.weights}
+      --head-channels ${model.head_channels}
+      --num-classes ${model.num_classes}
+      --class-weight ${loss.class_weight}
+      --box-weight ${loss.box_weight}
+      --negative-class-weight ${loss.negative_class_weight}
+      --val-score-threshold ${validation.score_threshold}
+      --val-iou-threshold ${validation.iou_threshold}
+      --val-nms-threshold ${validation.nms_threshold}
+      --val-pre-nms-topk ${validation.pre_nms_topk}
+      --val-max-detections ${validation.max_detections}
+      --val-plot-score-threshold ${validation.plot_score_threshold}
+      --val-plot-max-boxes ${validation.plot_max_boxes}
+      --seed ${reproducibility.seed}
+      --metrics-file ${reports.dir}/metrics.json
+      --history-file ${reports.dir}/metrics_history.jsonl
+      --inventory-dir ${reports.dir}/inventory
+      --wandb-mode ${tracking.wandb_mode}
+      --wandb-project ${tracking.wandb_project}
+      --wandb-log-every ${tracking.wandb_log_every}
+      --wandb-log-checkpoints ${tracking.wandb_log_checkpoints}
+      --progress text
+    deps:
+      - scripts/train_resnet_yolo.py
+      - src/yolo_tests/data
+      - src/yolo_tests/losses
+      - src/yolo_tests/models
+      - datasets/coco
+      - coco.yaml
+    params:
+      - train
+      - model
+      - loss
+      - validation
+      - reproducibility
+      - tracking
+      - reports
+    outs:
+      - ${train.output_dir}:
+          persist: true
+    metrics:
+      - ${reports.dir}/metrics.json:
+          cache: false
+      - ${reports.dir}/inventory/dataset_inventory.json:
+          cache: false
+      - ${reports.dir}/inventory/model_inventory.json:
+          cache: false
+
+artifacts:
+  coco-yolo-dataset:
+    path: datasets/coco
+    type: dataset
+    desc: COCO dataset in YOLO label format used by the educational detector.
+    labels:
+      - coco
+      - detection
+      - yolo
+    meta:
+      inventory: reports/resnet_anchor_free/inventory/dataset_inventory.json
+  resnet-anchor-free-yolo:
+    path: runs/resnet_anchor_free
+    type: model
+    desc: Educational ResNet anchor-free YOLO checkpoints.
+    labels:
+      - pytorch
+      - resnet
+      - anchor-free-yolo
+    meta:
+      framework: pytorch
+      stage: train_resnet_anchor_free
+      inventory: reports/resnet_anchor_free/inventory/model_inventory.json

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the educational ResNet one-anchor YOLO model.
+"""Train the educational ResNet anchor-free YOLO model.
 
 This script is intentionally small and explicit. It is useful for learning the
 flow from dataloader -> model -> assignment/loss -> optimizer step. The model is
@@ -10,15 +10,22 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import ipaddress
+import json
 import os
+import platform
+import random
 import socket
+import subprocess
+import sys
 import time
 from contextlib import nullcontext
-from datetime import timedelta
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -26,8 +33,8 @@ from torch.nn.parallel import DistributedDataParallel
 from torchvision.ops import box_iou, nms
 
 from yolo_tests.data import CocoYoloDetection, create_coco_yolo_dataloader, load_coco_class_names
-from yolo_tests.losses import OneAnchorYoloLoss
-from yolo_tests.models import ResNetOneAnchorYolo, ensure_resnet_weights_available
+from yolo_tests.losses import AnchorFreeYoloLoss
+from yolo_tests.models import ResNetAnchorFreeYolo, ensure_resnet_weights_available
 
 try:
     from torch.distributed.fsdp import FullyShardedDataParallel
@@ -63,7 +70,8 @@ def parse_args() -> argparse.Namespace:
         help="ResNet backbone. The default is pretrained ResNet-101.",
     )
     parser.add_argument("--weights", choices=["default", "pretrained", "imagenet", "none"], default="default")
-    parser.add_argument("--anchor-size", type=float, default=0.10, help="Normalized anchor width/height. 0.10 is 64px at 640.")
+    parser.add_argument("--anchor-size", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--head-channels", type=int, default=256, help="Channel width of the anchor-free detection head.")
     parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
     parser.add_argument("--local-rank", "--local_rank", type=int, default=None, help="Accepted for torchrun compatibility.")
@@ -80,8 +88,44 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force conservative NCCL settings by using IPv4 sockets and disabling P2P/IB/SHM paths.",
     )
-    parser.add_argument("--output-dir", type=Path, default=Path("runs/resnet_one_anchor"))
+    parser.add_argument("--output-dir", type=Path, default=Path("runs/resnet_anchor_free"))
     parser.add_argument("--save-every", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42, help="Base random seed for Python, NumPy, and PyTorch.")
+    parser.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Request deterministic PyTorch algorithms where possible. This can reduce throughput.",
+    )
+    parser.add_argument(
+        "--metrics-file",
+        type=Path,
+        default=None,
+        help="JSON metrics summary path. Defaults to <output-dir>/metrics.json.",
+    )
+    parser.add_argument(
+        "--history-file",
+        type=Path,
+        default=None,
+        help="Line-delimited JSON metrics history path. Defaults to <output-dir>/metrics_history.jsonl.",
+    )
+    parser.add_argument(
+        "--inventory-dir",
+        type=Path,
+        default=None,
+        help="Directory for dataset/model inventory JSON. Defaults to <output-dir>/inventory.",
+    )
+    parser.add_argument(
+        "--write-inventory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write dataset and model inventory files for reproducibility and DVC metadata.",
+    )
+    parser.add_argument(
+        "--inventory-hash-files",
+        action="store_true",
+        help="Include SHA-256 hashes for large dataset/model files. Off by default because COCO/checkpoints are large.",
+    )
     parser.add_argument("--no-validation", action="store_true", help="Skip validation after each epoch.")
     parser.add_argument("--names-yaml", type=Path, default=Path("/data/yolo/coco.yaml"))
     parser.add_argument("--val-score-threshold", type=float, default=0.001)
@@ -109,6 +153,37 @@ def parse_args() -> argparse.Namespace:
         help="Save one validation image with ground-truth and predicted boxes after each epoch.",
     )
     parser.add_argument("--log-every", type=int, default=10, help="Text log interval when progress bars are disabled.")
+    parser.add_argument(
+        "--wandb-mode",
+        choices=["disabled", "offline", "online"],
+        default="online",
+        help="Enable W&B logging on rank 0. Use online with WANDB_API_KEY set, or offline for local logs.",
+    )
+    parser.add_argument("--wandb-project", default=os.environ.get("WANDB_PROJECT", "yolo-backbone-tests"))
+    parser.add_argument("--wandb-entity", default=os.environ.get("WANDB_ENTITY"))
+    parser.add_argument("--wandb-name", default=os.environ.get("WANDB_NAME"))
+    parser.add_argument("--wandb-notes", default=os.environ.get("WANDB_NOTES"))
+    parser.add_argument("--wandb-tags", default=os.environ.get("WANDB_TAGS", ""), help="Comma-separated W&B tags.")
+    parser.add_argument("--wandb-dir", type=Path, default=Path("wandb"), help="Local W&B run directory.")
+    parser.add_argument(
+        "--wandb-watch",
+        choices=["none", "gradients", "parameters", "all"],
+        default="none",
+        help="Optional W&B parameter/gradient watching mode.",
+    )
+    parser.add_argument("--wandb-log-every", type=int, default=10, help="Step interval for W&B train metrics.")
+    parser.add_argument(
+        "--wandb-log-checkpoints",
+        choices=["none", "last", "all"],
+        default="none",
+        help="Upload checkpoint files as W&B model artifacts. DVC remains the primary model versioning layer.",
+    )
+    parser.add_argument(
+        "--wandb-log-inventory-artifacts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Log dataset/model inventory JSON as small W&B artifacts when W&B is enabled.",
+    )
     parser.add_argument(
         "--progress",
         choices=["auto", "tqdm", "text", "none"],
@@ -140,6 +215,398 @@ def parse_args() -> argparse.Namespace:
         help="torch.compile mode.",
     )
     return parser.parse_args()
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def resolve_metrics_file(args: argparse.Namespace) -> Path:
+    return args.metrics_file if args.metrics_file is not None else args.output_dir / "metrics.json"
+
+
+def resolve_history_file(args: argparse.Namespace) -> Path:
+    return args.history_file if args.history_file is not None else args.output_dir / "metrics_history.jsonl"
+
+
+def resolve_inventory_dir(args: argparse.Namespace) -> Path:
+    return args.inventory_dir if args.inventory_dir is not None else args.output_dir / "inventory"
+
+
+def json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, torch.device):
+        return str(value)
+    if isinstance(value, torch.dtype):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [json_safe(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except (TypeError, ValueError):
+            pass
+    return str(value)
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(json_safe(payload), indent=2, sort_keys=True) + "\n")
+
+
+def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as file:
+        file.write(json.dumps(json_safe(payload), sort_keys=True) + "\n")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def file_inventory(path: Path, include_hash: bool = False, small_hash_limit: int = 64 * 1024 * 1024) -> dict[str, Any]:
+    resolved = path.expanduser()
+    info: dict[str, Any] = {
+        "path": str(resolved),
+        "exists": resolved.exists(),
+    }
+    if not resolved.exists() or not resolved.is_file():
+        return info
+
+    stat = resolved.stat()
+    info.update(
+        {
+            "size_bytes": stat.st_size,
+            "mtime_utc": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).replace(microsecond=0).isoformat(),
+        }
+    )
+    if include_hash or stat.st_size <= small_hash_limit:
+        info["sha256"] = sha256_file(resolved)
+    return info
+
+
+def run_git_command(args: list[str]) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip()
+
+
+def git_inventory() -> dict[str, Any]:
+    status = run_git_command(["status", "--short"])
+    return {
+        "commit": run_git_command(["rev-parse", "HEAD"]),
+        "branch": run_git_command(["rev-parse", "--abbrev-ref", "HEAD"]),
+        "dirty": bool(status),
+        "status_short": status.splitlines() if status else [],
+    }
+
+
+def runtime_inventory() -> dict[str, Any]:
+    try:
+        import torchvision
+
+        torchvision_version = torchvision.__version__
+    except Exception:  # pragma: no cover - runtime metadata only
+        torchvision_version = None
+
+    cuda_devices = []
+    if torch.cuda.is_available():
+        for index in range(torch.cuda.device_count()):
+            cuda_devices.append(
+                {
+                    "index": index,
+                    "name": torch.cuda.get_device_name(index),
+                    "capability": torch.cuda.get_device_capability(index),
+                }
+            )
+
+    return {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+        "torchvision": torchvision_version,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_version": torch.version.cuda,
+        "cuda_devices": cuda_devices,
+    }
+
+
+def configure_reproducibility(args: argparse.Namespace) -> None:
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    if args.deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def capture_rng_state() -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def split_file_path(root: Path, split: str) -> Path:
+    return root / f"{split}.txt"
+
+
+def dataset_split_inventory(dataset: CocoYoloDetection, args: argparse.Namespace) -> dict[str, Any]:
+    image_bytes = 0
+    label_bytes = 0
+    missing_images = 0
+    missing_labels = 0
+    label_file_count = 0
+    sample_records: list[dict[str, str]] = []
+
+    for index, record in enumerate(dataset.records):
+        if index < 5:
+            sample_records.append(
+                {
+                    "image_path": str(record.image_path),
+                    "label_path": str(record.label_path),
+                }
+            )
+
+        if record.image_path.exists():
+            image_bytes += record.image_path.stat().st_size
+        else:
+            missing_images += 1
+
+        if record.label_path.exists():
+            label_bytes += record.label_path.stat().st_size
+            label_file_count += 1
+        else:
+            missing_labels += 1
+
+    root = dataset.root
+    annotation_name = f"instances_{dataset.split}.json"
+    return {
+        "split": dataset.split,
+        "samples": len(dataset),
+        "image_size": dataset.image_size,
+        "letterbox": dataset.letterbox,
+        "split_file": file_inventory(split_file_path(root, dataset.split), include_hash=True),
+        "annotation_file": file_inventory(root / "annotations" / annotation_name, include_hash=args.inventory_hash_files),
+        "image_archive": file_inventory(root / "images" / f"{dataset.split}.zip", include_hash=args.inventory_hash_files),
+        "image_bytes": image_bytes,
+        "label_files": label_file_count,
+        "label_bytes": label_bytes,
+        "missing_images": missing_images,
+        "missing_labels": missing_labels,
+        "sample_records": sample_records,
+    }
+
+
+def build_dataset_inventory(
+    train_dataset: CocoYoloDetection,
+    val_dataset: CocoYoloDetection | None,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    datasets = [train_dataset]
+    if val_dataset is not None and val_dataset.split != train_dataset.split:
+        datasets.append(val_dataset)
+
+    return {
+        "generated_at_utc": utc_now_iso(),
+        "root": str(train_dataset.root),
+        "names_yaml": file_inventory(args.names_yaml, include_hash=True),
+        "splits": {dataset.split: dataset_split_inventory(dataset, args) for dataset in datasets},
+    }
+
+
+def checkpoint_inventory(path: Path, include_hash: bool) -> dict[str, Any]:
+    info = file_inventory(path, include_hash=include_hash)
+    if path.name.startswith("epoch_") and path.suffix == ".pt":
+        try:
+            info["epoch"] = int(path.stem.removeprefix("epoch_"))
+        except ValueError:
+            pass
+    return info
+
+
+def scan_checkpoints(output_dir: Path, include_hash: bool) -> list[dict[str, Any]]:
+    if not output_dir.exists():
+        return []
+    return [
+        checkpoint_inventory(path, include_hash=include_hash)
+        for path in sorted(output_dir.glob("*.pt"))
+        if path.is_file()
+    ]
+
+
+def count_parameters(model: nn.Module) -> dict[str, int]:
+    parameters = list(model.parameters())
+    buffers = list(model.buffers())
+    return {
+        "parameters": sum(parameter.numel() for parameter in parameters),
+        "trainable_parameters": sum(parameter.numel() for parameter in parameters if parameter.requires_grad),
+        "parameter_bytes": sum(parameter.numel() * parameter.element_size() for parameter in parameters),
+        "buffers": sum(buffer.numel() for buffer in buffers),
+        "buffer_bytes": sum(buffer.numel() * buffer.element_size() for buffer in buffers),
+    }
+
+
+def build_model_inventory(
+    model: nn.Module,
+    args: argparse.Namespace,
+    checkpoint_path: Path | None = None,
+) -> dict[str, Any]:
+    checkpoints = scan_checkpoints(args.output_dir, include_hash=args.inventory_hash_files)
+    latest_checkpoint = checkpoint_inventory(checkpoint_path, include_hash=args.inventory_hash_files) if checkpoint_path else None
+    return {
+        "generated_at_utc": utc_now_iso(),
+        "architecture": type(unwrap_model(model)).__name__,
+        "backbone": args.backbone,
+        "weights": args.weights,
+        "num_classes": args.num_classes,
+        "head_channels": args.head_channels,
+        "freeze_backbone": args.freeze_backbone,
+        "output_dir": str(args.output_dir),
+        "checkpoint_count": len(checkpoints),
+        "checkpoint_bytes": sum(int(item.get("size_bytes", 0)) for item in checkpoints),
+        "latest_checkpoint": latest_checkpoint,
+        "checkpoints": checkpoints,
+        "parameters": count_parameters(unwrap_model(model)),
+    }
+
+
+def write_run_manifest(args: argparse.Namespace, dataset_inventory: dict[str, Any] | None) -> Path:
+    manifest_path = args.output_dir / "run_manifest.json"
+    write_json(
+        manifest_path,
+        {
+            "generated_at_utc": utc_now_iso(),
+            "argv": sys.argv,
+            "args": vars(args),
+            "git": git_inventory(),
+            "runtime": runtime_inventory(),
+            "dataset_inventory": dataset_inventory,
+        },
+    )
+    return manifest_path
+
+
+def parse_wandb_tags(tags: str | None) -> list[str] | None:
+    if not tags:
+        return None
+    parsed = [tag.strip() for tag in tags.split(",") if tag.strip()]
+    return parsed or None
+
+
+class ExperimentTracker:
+    def __init__(self, wandb_module: Any | None = None, run: Any | None = None) -> None:
+        self.wandb = wandb_module
+        self.run = run
+
+    @property
+    def enabled(self) -> bool:
+        return self.run is not None
+
+    @property
+    def url(self) -> str | None:
+        if self.run is None:
+            return None
+        return getattr(self.run, "url", None)
+
+    def log(self, metrics: dict[str, Any], step: int | None = None) -> None:
+        if self.run is None:
+            return
+        self.run.log(json_safe(metrics), step=step)
+
+    def watch(self, model: nn.Module, mode: str) -> None:
+        if self.run is None or self.wandb is None or mode == "none":
+            return
+        self.wandb.watch(model, log=mode, log_freq=100)
+
+    def log_image(self, key: str, path: Path | None, caption: str, step: int | None = None) -> None:
+        if self.run is None or self.wandb is None or path is None or not path.exists():
+            return
+        self.run.log({key: self.wandb.Image(str(path), caption=caption)}, step=step)
+
+    def log_file_artifact(
+        self,
+        name: str,
+        artifact_type: str,
+        path: Path,
+        metadata: dict[str, Any] | None = None,
+        aliases: list[str] | None = None,
+    ) -> None:
+        if self.run is None or self.wandb is None or not path.exists():
+            return
+        artifact = self.wandb.Artifact(name=name, type=artifact_type, metadata=json_safe(metadata or {}))
+        artifact.add_file(str(path))
+        self.run.log_artifact(artifact, aliases=aliases)
+
+    def finish(self) -> None:
+        if self.run is not None:
+            self.run.finish()
+
+
+def initialize_wandb(
+    args: argparse.Namespace,
+    dataset_inventory: dict[str, Any] | None,
+    manifest_path: Path | None,
+) -> ExperimentTracker:
+    if not is_main_process() or args.wandb_mode == "disabled":
+        return ExperimentTracker()
+
+    try:
+        import wandb
+    except ImportError as exc:
+        raise RuntimeError("W&B logging requested. Install it with: python3 -m pip install -e '.[experiment]'") from exc
+
+    args.wandb_dir.mkdir(parents=True, exist_ok=True)
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        dir=str(args.wandb_dir),
+        name=args.wandb_name,
+        notes=args.wandb_notes,
+        tags=parse_wandb_tags(args.wandb_tags),
+        config={
+            "args": json_safe(vars(args)),
+            "git": git_inventory(),
+            "runtime": runtime_inventory(),
+            "dataset_inventory": dataset_inventory,
+            "run_manifest": str(manifest_path) if manifest_path is not None else None,
+        },
+        mode=args.wandb_mode,
+        job_type="train",
+        save_code=True,
+    )
+    tracker = ExperimentTracker(wandb_module=wandb, run=run)
+    if tracker.url:
+        print(f"wandb_run: {tracker.url}", flush=True)
+    else:
+        print(f"wandb_run_id: {run.id}", flush=True)
+    return tracker
 
 
 def distributed_world_size() -> int:
@@ -805,7 +1272,7 @@ def save_validation_example(
 def validate_one_epoch(
     model: nn.Module,
     loader: Any,
-    criterion: OneAnchorYoloLoss,
+    criterion: AnchorFreeYoloLoss,
     args: argparse.Namespace,
     device: torch.device,
     epoch: int,
@@ -928,7 +1395,7 @@ def save_checkpoint(
     epoch: int,
     step: int,
     args: argparse.Namespace,
-) -> None:
+) -> Path:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         "epoch": epoch,
@@ -936,31 +1403,42 @@ def save_checkpoint(
         "model": unwrap_model(model).state_dict(),
         "optimizer": optimizer.state_dict(),
         "args": vars(args),
+        "rng_state": capture_rng_state(),
+        "git": git_inventory(),
     }
     path = args.output_dir / f"epoch_{epoch:03d}.pt"
     torch.save(checkpoint, path)
     print(f"saved_checkpoint: {path}", flush=True)
+    return path
 
 
 def main() -> None:
     args = parse_args()
+    configure_reproducibility(args)
     log_stage(args, "parsed args", all_ranks=True)
 
     device = choose_device(args)
     log_stage(args, f"selected device={device}", all_ranks=True)
 
     if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = not args.deterministic
+        torch.backends.cuda.matmul.allow_tf32 = not args.deterministic
+        torch.backends.cudnn.allow_tf32 = not args.deterministic
         if hasattr(torch, "set_float32_matmul_precision"):
-            torch.set_float32_matmul_precision("high")
+            torch.set_float32_matmul_precision("highest" if args.deterministic else "high")
 
     configure_distributed_environment(args, device)
     setup_distributed(args, device)
     run_distributed_smoke_test(args, device)
 
+    if is_main_process():
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        history_file = resolve_history_file(args)
+        if history_file.exists():
+            history_file.unlink()
+
     amp_dtype = choose_amp_dtype(args, device)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and amp_dtype == torch.float16))
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and amp_dtype == torch.float16))
 
     log_stage(args, "building dataset", all_ranks=True)
     dataset = CocoYoloDetection(
@@ -996,6 +1474,7 @@ def main() -> None:
     log_stage(args, f"dataloader ready steps_per_epoch={len(loader)}", all_ranks=True)
 
     val_loader = None
+    val_dataset = None
     val_sample_count = 0
     class_names: dict[int, str] = {}
     if not args.no_validation and is_main_process():
@@ -1020,14 +1499,35 @@ def main() -> None:
         class_names = load_class_names(args)
         log_stage(args, f"validation dataloader ready steps={len(val_loader)}", all_ranks=False)
 
+    tracker = ExperimentTracker()
+    dataset_inventory = None
+    manifest_path = None
+    dataset_inventory_path = resolve_inventory_dir(args) / "dataset_inventory.json"
+    if is_main_process():
+        if args.write_inventory:
+            dataset_inventory = build_dataset_inventory(dataset, val_dataset, args)
+            write_json(dataset_inventory_path, dataset_inventory)
+            print(f"dataset_inventory: {dataset_inventory_path}", flush=True)
+        manifest_path = write_run_manifest(args, dataset_inventory)
+        print(f"run_manifest: {manifest_path}", flush=True)
+        tracker = initialize_wandb(args, dataset_inventory, manifest_path)
+        if args.write_inventory and args.wandb_log_inventory_artifacts:
+            tracker.log_file_artifact(
+                name="coco-yolo-dataset-inventory",
+                artifact_type="dataset",
+                path=dataset_inventory_path,
+                metadata={"root": str(args.root), "split": args.split, "val_split": args.val_split},
+                aliases=["latest"],
+            )
+
     log_stage(args, "building model on CPU", all_ranks=True)
     synchronize_pretrained_weight_cache(args)
-    model = ResNetOneAnchorYolo(
+    model = ResNetAnchorFreeYolo(
         num_classes=args.num_classes,
         backbone_name=args.backbone,
         weights=args.weights,
-        anchor_size=args.anchor_size,
         freeze_backbone=args.freeze_backbone,
+        head_channels=args.head_channels,
     )
     log_stage(args, f"moving model to {device}", all_ranks=True)
     model = model.to(device)
@@ -1039,8 +1539,23 @@ def main() -> None:
     log_stage(args, f"wrapping model wrap={args.wrap}", all_ranks=True)
     model = wrap_model(model, args, device)
     log_stage(args, "model ready", all_ranks=True)
+    if is_main_process():
+        tracker.watch(unwrap_model(model), args.wandb_watch)
+        if args.write_inventory:
+            model_inventory_path = resolve_inventory_dir(args) / "model_inventory.json"
+            model_inventory = build_model_inventory(model, args)
+            write_json(model_inventory_path, model_inventory)
+            print(f"model_inventory: {model_inventory_path}", flush=True)
+            if args.wandb_log_inventory_artifacts:
+                tracker.log_file_artifact(
+                    name="resnet-anchor-free-yolo-model-inventory",
+                    artifact_type="model",
+                    path=model_inventory_path,
+                    metadata={"backbone": args.backbone, "weights": args.weights},
+                    aliases=["latest"],
+                )
 
-    criterion = OneAnchorYoloLoss(
+    criterion = AnchorFreeYoloLoss(
         num_classes=args.num_classes,
         class_weight=args.class_weight,
         box_weight=args.box_weight,
@@ -1060,9 +1575,11 @@ def main() -> None:
             print(f"validation_samples: {val_sample_count}", flush=True)
         print(f"backbone: {args.backbone}, weights: {args.weights}", flush=True)
         print(f"distributed: {dist.is_initialized()}, wrap: {args.wrap}, world_size: {distributed_world_size()}", flush=True)
-        print(f"anchor_size: {args.anchor_size}", flush=True)
+        print(f"head_channels: {args.head_channels}", flush=True)
         print(f"amp: {args.amp}, amp_dtype: {amp_dtype}", flush=True)
         print(f"compile: {args.compile}, compile_mode: {args.compile_mode}", flush=True)
+        print(f"seed: {args.seed}, deterministic: {args.deterministic}", flush=True)
+        print(f"wandb_mode: {args.wandb_mode}, wandb_project: {args.wandb_project}", flush=True)
 
     global_step = 0
     for epoch in range(args.epochs):
@@ -1127,6 +1644,29 @@ def main() -> None:
                 target_class_prob_value = float(loss_dict["target_class_prob"].item())
                 positive_count = int(loss_dict["num_positive"].item())
 
+                if (
+                    is_main_process()
+                    and tracker.enabled
+                    and args.wandb_log_every > 0
+                    and global_step % args.wandb_log_every == 0
+                ):
+                    tracker.log(
+                        {
+                            "train/loss": loss_value,
+                            "train/class_loss": class_loss_value,
+                            "train/positive_class_loss": positive_class_loss_value,
+                            "train/negative_class_loss": negative_class_loss_value,
+                            "train/box_loss": box_loss_value,
+                            "train/mean_iou": mean_iou_value,
+                            "train/target_class_prob": target_class_prob_value,
+                            "train/positive_cells": positive_count,
+                            "train/images_per_second": images_per_second,
+                            "train/lr": optimizer.param_groups[0]["lr"],
+                            "epoch": epoch + 1,
+                        },
+                        step=global_step,
+                    )
+
                 completed_steps += 1
                 epoch_loss_sum += loss_value
                 epoch_class_loss_sum += class_loss_value
@@ -1171,24 +1711,62 @@ def main() -> None:
             if progress_bar is not None:
                 progress_bar.close()
 
+        train_epoch_metrics: dict[str, Any] | None = None
         if is_main_process() and completed_steps > 0:
             epoch_time = max(time.perf_counter() - epoch_start, 1e-9)
             global_examples = completed_steps * args.batch_size * distributed_world_size()
+            train_epoch_metrics = {
+                "epoch": epoch + 1,
+                "steps": completed_steps,
+                "loss": epoch_loss_sum / completed_steps,
+                "class_loss": epoch_class_loss_sum / completed_steps,
+                "positive_class_loss": epoch_positive_class_loss_sum / completed_steps,
+                "negative_class_loss": epoch_negative_class_loss_sum / completed_steps,
+                "box_loss": epoch_box_loss_sum / completed_steps,
+                "mean_iou": epoch_iou_sum / completed_steps,
+                "target_class_prob": epoch_target_class_prob_sum / completed_steps,
+                "positive_cells": epoch_positive_sum,
+                "avg_images_per_second": global_examples / epoch_time,
+                "epoch_seconds": epoch_time,
+                "global_step": global_step,
+            }
             print(
                 f"epoch={epoch} summary "
-                f"steps={completed_steps} "
-                f"loss={epoch_loss_sum / completed_steps:.4f} "
-                f"class={epoch_class_loss_sum / completed_steps:.4f} "
-                f"pos_cls={epoch_positive_class_loss_sum / completed_steps:.4f} "
-                f"bg_cls={epoch_negative_class_loss_sum / completed_steps:.4f} "
-                f"box={epoch_box_loss_sum / completed_steps:.4f} "
-                f"iou={epoch_iou_sum / completed_steps:.4f} "
-                f"p_cls={epoch_target_class_prob_sum / completed_steps:.4f} "
-                f"positives={epoch_positive_sum} "
-                f"avg_img/s={global_examples / epoch_time:.1f}",
+                f"steps={train_epoch_metrics['steps']} "
+                f"loss={train_epoch_metrics['loss']:.4f} "
+                f"class={train_epoch_metrics['class_loss']:.4f} "
+                f"pos_cls={train_epoch_metrics['positive_class_loss']:.4f} "
+                f"bg_cls={train_epoch_metrics['negative_class_loss']:.4f} "
+                f"box={train_epoch_metrics['box_loss']:.4f} "
+                f"iou={train_epoch_metrics['mean_iou']:.4f} "
+                f"p_cls={train_epoch_metrics['target_class_prob']:.4f} "
+                f"positives={train_epoch_metrics['positive_cells']} "
+                f"avg_img/s={train_epoch_metrics['avg_images_per_second']:.1f}",
                 flush=True,
             )
+            append_jsonl(
+                resolve_history_file(args),
+                {
+                    "phase": "train",
+                    "time_utc": utc_now_iso(),
+                    **train_epoch_metrics,
+                },
+            )
+            tracker.log(
+                {
+                    "epoch/train_loss": train_epoch_metrics["loss"],
+                    "epoch/train_class_loss": train_epoch_metrics["class_loss"],
+                    "epoch/train_box_loss": train_epoch_metrics["box_loss"],
+                    "epoch/train_mean_iou": train_epoch_metrics["mean_iou"],
+                    "epoch/train_target_class_prob": train_epoch_metrics["target_class_prob"],
+                    "epoch/train_positive_cells": train_epoch_metrics["positive_cells"],
+                    "epoch/train_avg_images_per_second": train_epoch_metrics["avg_images_per_second"],
+                    "epoch": epoch + 1,
+                },
+                step=global_step,
+            )
 
+        validation_metrics: dict[str, Any] | None = None
         if not args.no_validation:
             if is_main_process() and val_loader is not None:
                 metrics = validate_one_epoch(
@@ -1202,12 +1780,91 @@ def main() -> None:
                     amp_dtype=amp_dtype,
                 )
                 print_validation_summary(epoch + 1, metrics, args)
+                validation_metrics = {
+                    "epoch": epoch + 1,
+                    "loss": metrics["loss"],
+                    "map": metrics["map"],
+                    "iou_threshold": args.val_iou_threshold,
+                    "evaluated_classes": metrics["evaluated_classes"],
+                    "targets": metrics["targets"],
+                    "predictions": metrics["predictions"],
+                    "steps": metrics["steps"],
+                    "images": metrics["images"],
+                    "example_path": metrics.get("example_path"),
+                    "global_step": global_step,
+                }
+                append_jsonl(
+                    resolve_history_file(args),
+                    {
+                        "phase": "validation",
+                        "time_utc": utc_now_iso(),
+                        **validation_metrics,
+                    },
+                )
+                tracker.log(
+                    {
+                        "val/loss": validation_metrics["loss"],
+                        "val/map": validation_metrics["map"],
+                        "val/evaluated_classes": validation_metrics["evaluated_classes"],
+                        "val/targets": validation_metrics["targets"],
+                        "val/predictions": validation_metrics["predictions"],
+                        "val/images": validation_metrics["images"],
+                        "epoch": epoch + 1,
+                    },
+                    step=global_step,
+                )
+                example_path = metrics.get("example_path")
+                tracker.log_image(
+                    "val/example",
+                    Path(example_path) if example_path is not None else None,
+                    caption=f"validation epoch {epoch + 1}",
+                    step=global_step,
+                )
             if dist.is_available() and dist.is_initialized():
                 dist.barrier()
 
-        if is_main_process() and args.save_every > 0 and (epoch + 1) % args.save_every == 0:
-            save_checkpoint(model, optimizer, epoch + 1, global_step, args)
+        if is_main_process():
+            write_json(
+                resolve_metrics_file(args),
+                {
+                    "time_utc": utc_now_iso(),
+                    "epoch": epoch + 1,
+                    "global_step": global_step,
+                    "train": train_epoch_metrics,
+                    "validation": validation_metrics,
+                    "wandb_url": tracker.url,
+                    "run_manifest": str(manifest_path) if manifest_path is not None else None,
+                    "dataset_inventory": str(dataset_inventory_path) if args.write_inventory else None,
+                    "model_inventory": str(resolve_inventory_dir(args) / "model_inventory.json") if args.write_inventory else None,
+                },
+            )
 
+        if is_main_process() and args.save_every > 0 and (epoch + 1) % args.save_every == 0:
+            checkpoint_path = save_checkpoint(model, optimizer, epoch + 1, global_step, args)
+            if args.write_inventory:
+                model_inventory_path = resolve_inventory_dir(args) / "model_inventory.json"
+                model_inventory = build_model_inventory(model, args, checkpoint_path=checkpoint_path)
+                write_json(model_inventory_path, model_inventory)
+                if args.wandb_log_inventory_artifacts:
+                    tracker.log_file_artifact(
+                        name="resnet-anchor-free-yolo-model-inventory",
+                        artifact_type="model",
+                        path=model_inventory_path,
+                        metadata={"backbone": args.backbone, "weights": args.weights, "checkpoint_count": model_inventory["checkpoint_count"]},
+                        aliases=["latest"],
+                    )
+            if args.wandb_log_checkpoints == "all" or (
+                args.wandb_log_checkpoints == "last" and epoch + 1 == args.epochs
+            ):
+                tracker.log_file_artifact(
+                    name="resnet-anchor-free-yolo-checkpoint",
+                    artifact_type="model",
+                    path=checkpoint_path,
+                    metadata={"epoch": epoch + 1, "global_step": global_step, "backbone": args.backbone},
+                    aliases=["latest", f"epoch-{epoch + 1:03d}"],
+                )
+
+    tracker.finish()
     cleanup_distributed()
 
 

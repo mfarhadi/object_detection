@@ -1,0 +1,8 @@
+# Keep transient local files out of DVC hashing.
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+wandb/
+datasets/**/*.tmp
+datasets/**/*.zip.tmp
