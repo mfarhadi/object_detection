@@ -14,6 +14,7 @@ import ipaddress
 import os
 import socket
 import time
+from contextlib import nullcontext
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -90,6 +91,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-max-detections", type=int, default=100)
     parser.add_argument("--val-plot-max-boxes", type=int, default=20)
     parser.add_argument(
+        "--val-plot-score-threshold",
+        type=float,
+        default=0.25,
+        help="Score threshold used only for saved validation example overlays.",
+    )
+    parser.add_argument(
+        "--val-plot-sample-index",
+        type=int,
+        default=None,
+        help="Validation dataset index to plot every epoch. Defaults to cycling by epoch.",
+    )
+    parser.add_argument(
         "--plot-val-example",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -108,6 +121,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--class-weight", type=float, default=1.0)
     parser.add_argument("--box-weight", type=float, default=5.0)
     parser.add_argument("--negative-class-weight", type=float, default=0.02)
+
+    parser.add_argument(
+        "--amp",
+        choices=["auto", "none", "fp16", "bf16"],
+        default="auto",
+        help="Mixed precision mode. auto uses bf16 when supported, otherwise fp16 on CUDA.",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Use torch.compile to improve speed on supported PyTorch/CUDA builds.",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        default="reduce-overhead",
+        help="torch.compile mode.",
+    )
     return parser.parse_args()
 
 
@@ -448,8 +479,8 @@ def target_image_id(target: dict[str, Any]) -> int:
 
 
 def decode_batch_detections(predictions: dict[str, Any], args: argparse.Namespace) -> list[dict[str, torch.Tensor]]:
-    class_probs = predictions["class_probs"].detach().cpu()
-    boxes_yolo = predictions["boxes_yolo"].detach().cpu()
+    class_probs = predictions["class_probs"].detach().cpu().to(dtype=torch.float32)
+    boxes_yolo = predictions["boxes_yolo"].detach().cpu().to(dtype=torch.float32)
     batch_size, num_classes, _, _ = class_probs.shape
     detections: list[dict[str, torch.Tensor]] = []
 
@@ -614,6 +645,63 @@ def class_label(class_id: int, class_names: dict[int, str]) -> str:
     return class_names.get(class_id, str(class_id))
 
 
+def validation_plot_image_id(loader: Any, epoch: int, args: argparse.Namespace) -> int | None:
+    if args.val_plot_sample_index is not None:
+        return max(args.val_plot_sample_index, 0)
+    dataset = getattr(loader, "dataset", None)
+    if dataset is None:
+        return None
+    try:
+        dataset_size = len(dataset)
+    except TypeError:
+        return None
+    if dataset_size <= 0:
+        return None
+    return epoch % dataset_size
+
+
+def filter_detection_for_plot(detection: dict[str, torch.Tensor], args: argparse.Namespace) -> dict[str, torch.Tensor]:
+    boxes = detection["boxes"].detach().cpu().to(dtype=torch.float32)
+    scores = detection["scores"].detach().cpu().to(dtype=torch.float32)
+    labels = detection["labels"].detach().cpu().to(dtype=torch.long)
+
+    keep = scores >= args.val_plot_score_threshold
+    boxes = boxes[keep]
+    scores = scores[keep]
+    labels = labels[keep]
+
+    max_predictions = max(args.val_plot_max_boxes, 0)
+    if max_predictions == 0:
+        return {
+            "boxes": boxes.new_empty((0, 4)),
+            "scores": scores.new_empty((0,)),
+            "labels": labels.new_empty((0,), dtype=torch.long),
+        }
+    if max_predictions > 0 and scores.numel() > max_predictions:
+        top_indices = scores.argsort(descending=True)[:max_predictions]
+        boxes = boxes[top_indices]
+        scores = scores[top_indices]
+        labels = labels[top_indices]
+
+    return {"boxes": boxes, "scores": scores, "labels": labels}
+
+
+def choose_amp_dtype(args: argparse.Namespace, device: torch.device) -> torch.dtype | None:
+    if device.type != "cuda" or args.amp == "none":
+        return None
+    if args.amp == "bf16":
+        return torch.bfloat16
+    if args.amp == "fp16":
+        return torch.float16
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
+def autocast_context(device: torch.device, amp_dtype: torch.dtype | None):
+    if amp_dtype is None:
+        return nullcontext()
+    return torch.autocast(device_type=device.type, dtype=amp_dtype)
+
+
 def save_validation_example(
     example: dict[str, Any],
     epoch: int,
@@ -632,13 +720,16 @@ def save_validation_example(
 
     image = example["image"]
     target = example["target"]
-    detection = example["detection"]
+    detection = filter_detection_for_plot(example["detection"], args)
     image_np = tensor_to_numpy_image(image)
     height, width = image_np.shape[:2]
 
     fig, ax = plt.subplots(figsize=(10, 10))
     ax.imshow(image_np)
-    ax.set_title(f"validation epoch {epoch + 1}: {Path(target['path']).name}")
+    ax.set_title(
+        f"validation epoch {epoch + 1}: {Path(target['path']).name} "
+        f"preds>={args.val_plot_score_threshold:g}: {int(detection['scores'].numel())}"
+    )
     ax.axis("off")
 
     gt_boxes = normalized_cxcywh_to_xyxy(target["boxes_yolo"].detach().cpu())
@@ -669,14 +760,13 @@ def save_validation_example(
             bbox=dict(facecolor="lime", alpha=0.75, edgecolor="none", pad=1.5),
         )
 
-    pred_boxes = detection["boxes"].detach().cpu()
-    pred_scores = detection["scores"].detach().cpu()
-    pred_labels = detection["labels"].detach().cpu().to(dtype=torch.long)
-    max_predictions = max(args.val_plot_max_boxes, 0)
+    pred_boxes = detection["boxes"]
+    pred_scores = detection["scores"]
+    pred_labels = detection["labels"]
     for box, score, label in zip(
-        pred_boxes[:max_predictions],
-        pred_scores[:max_predictions],
-        pred_labels[:max_predictions],
+        pred_boxes,
+        pred_scores,
+        pred_labels,
         strict=False,
     ):
         x1, y1, x2, y2 = box.tolist()
@@ -720,6 +810,7 @@ def validate_one_epoch(
     device: torch.device,
     epoch: int,
     class_names: dict[int, str],
+    amp_dtype: torch.dtype | None,
 ) -> dict[str, Any]:
     was_training = model.training
     model.eval()
@@ -732,6 +823,8 @@ def validate_one_epoch(
     all_detections: list[dict[str, Any]] = []
     all_targets: list[dict[str, Any]] = []
     example: dict[str, Any] | None = None
+    fallback_example: dict[str, Any] | None = None
+    plot_image_id = validation_plot_image_id(loader, epoch, args) if args.plot_val_example else None
 
     try:
         with torch.no_grad():
@@ -740,8 +833,9 @@ def validate_one_epoch(
                     break
 
                 images, yolo_targets = move_batch_to_device(batch, device)
-                predictions = model(images)
-                loss_dict = criterion(predictions, yolo_targets)
+                with autocast_context(device, amp_dtype):
+                    predictions = model(images)
+                    loss_dict = criterion(predictions, yolo_targets)
                 batch_detections = decode_batch_detections(predictions, args)
 
                 completed_steps += 1
@@ -766,12 +860,16 @@ def validate_one_epoch(
                             "labels": target["labels"].detach().cpu(),
                         }
                     )
-                    if example is None and args.plot_val_example:
-                        example = {
+                    if args.plot_val_example:
+                        candidate_example = {
                             "image": images[batch_index].detach().cpu(),
                             "target": target,
                             "detection": detection,
                         }
+                        if fallback_example is None:
+                            fallback_example = candidate_example
+                        if example is None and (plot_image_id is None or image_id == plot_image_id):
+                            example = candidate_example
 
                 if progress_bar is not None:
                     progress_bar.set_postfix(loss=f"{loss_sum / completed_steps:.4f}")
@@ -797,6 +895,8 @@ def validate_one_epoch(
     metrics["steps"] = completed_steps
     metrics["images"] = image_count
 
+    if example is None:
+        example = fallback_example
     if example is not None:
         metrics["example_path"] = save_validation_example(example, epoch, args, class_names)
     else:
@@ -845,11 +945,22 @@ def save_checkpoint(
 def main() -> None:
     args = parse_args()
     log_stage(args, "parsed args", all_ranks=True)
+
     device = choose_device(args)
     log_stage(args, f"selected device={device}", all_ranks=True)
+
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+
     configure_distributed_environment(args, device)
     setup_distributed(args, device)
     run_distributed_smoke_test(args, device)
+
+    amp_dtype = choose_amp_dtype(args, device)
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and amp_dtype == torch.float16))
 
     log_stage(args, "building dataset", all_ranks=True)
     dataset = CocoYoloDetection(
@@ -920,6 +1031,11 @@ def main() -> None:
     )
     log_stage(args, f"moving model to {device}", all_ranks=True)
     model = model.to(device)
+
+    if args.compile and device.type == "cuda" and args.wrap != "fsdp":
+        log_stage(args, f"compiling model mode={args.compile_mode}", all_ranks=True)
+        model = torch.compile(model, mode=args.compile_mode)
+
     log_stage(args, f"wrapping model wrap={args.wrap}", all_ranks=True)
     model = wrap_model(model, args, device)
     log_stage(args, "model ready", all_ranks=True)
@@ -945,6 +1061,8 @@ def main() -> None:
         print(f"backbone: {args.backbone}, weights: {args.weights}", flush=True)
         print(f"distributed: {dist.is_initialized()}, wrap: {args.wrap}, world_size: {distributed_world_size()}", flush=True)
         print(f"anchor_size: {args.anchor_size}", flush=True)
+        print(f"amp: {args.amp}, amp_dtype: {amp_dtype}", flush=True)
+        print(f"compile: {args.compile}, compile_mode: {args.compile_mode}", flush=True)
 
     global_step = 0
     for epoch in range(args.epochs):
@@ -980,13 +1098,20 @@ def main() -> None:
                         flush=True,
                     )
 
-                predictions = model(images)
-                loss_dict = criterion(predictions, yolo_targets)
-                loss = loss_dict["loss"]
-
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+
+                with autocast_context(device, amp_dtype):
+                    predictions = model(images)
+                    loss_dict = criterion(predictions, yolo_targets)
+                    loss = loss_dict["loss"]
+
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
 
                 local_batch_size = int(images.shape[0])
                 global_batch_size = local_batch_size * distributed_world_size()
@@ -1074,6 +1199,7 @@ def main() -> None:
                     device=device,
                     epoch=epoch,
                     class_names=class_names,
+                    amp_dtype=amp_dtype,
                 )
                 print_validation_summary(epoch + 1, metrics, args)
             if dist.is_available() and dist.is_initialized():
@@ -1086,4 +1212,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        cleanup_distributed()

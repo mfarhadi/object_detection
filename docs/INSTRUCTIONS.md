@@ -224,9 +224,12 @@ PYTHONPATH=/data/yolo/src torchrun \
 After every epoch the trainer runs validation on `--val-split val2017` by
 default, prints `mAP@0.50`, and saves one overlay image to
 `runs/resnet_one_anchor/val_examples/epoch_001.png`. Green boxes are validation
-labels and red dashed boxes are predictions. Use `--val-max-steps` for quick
-checks, `--no-validation` to skip validation, and `--no-plot-val-example` to
-skip the saved image.
+labels and red dashed boxes are predictions. The plotted image cycles by epoch
+by default; use `--val-plot-sample-index 0` to pin a fixed validation image.
+Plot overlays use `--val-plot-score-threshold`, which is separate from the
+lower score threshold used for mAP. Use `--val-max-steps` for quick checks,
+`--no-validation` to skip validation, and `--no-plot-val-example` to skip the
+saved image.
 
 Loss/progress metrics:
 
